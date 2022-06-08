@@ -2,22 +2,42 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/homedir"
+
+	_ "k8s.io/client-go/plugin/pkg/client/auth"
+	_ "k8s.io/client-go/plugin/pkg/client/auth/azure"
+	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
+	_ "k8s.io/client-go/plugin/pkg/client/auth/oidc"
+	_ "k8s.io/client-go/plugin/pkg/client/auth/openstack"
 )
 
 var (
-	secretShares    int
-	secretThreshold int
-	outputFile      string
-	inputFile       string
+	secretShares       int
+	secretThreshold    int
+	k8sSecret          bool
+	k8sSecretNamespace string
+	k8sSecretName      string
+	k8sInCluster       bool
+	outputFile         string
+	inputFile          string
 )
 
 func init() {
@@ -25,6 +45,10 @@ func init() {
 	flag.IntVar(&secretThreshold, "secret-threshold", 3, "Number of master keys you need to unseal the Vault")
 	flag.StringVar(&outputFile, "output", "/tmp/vault-init.json", "Output file in which store the master keys and root token")
 	flag.StringVar(&inputFile, "input", "/tmp/vault-init.json", "Input file used to load unseal data")
+	flag.BoolVar(&k8sSecret, "k8s-secret", false, "Is the thing stored in a k8s secret ?")
+	flag.BoolVar(&k8sInCluster, "k8s-in-cluster", false, "are we running in cluster ?")
+	flag.StringVar(&k8sSecretNamespace, "k8s-ns", "default", "Name of the k8s ns the secret is stored in")
+	flag.StringVar(&k8sSecretName, "k8s-secret-name", "vault-unseal", "Name of the vault secret unseal")
 }
 
 type VaultStatus struct {
@@ -172,12 +196,102 @@ func unsealVault(vaultAddr string, keys []string) (bool, error) {
 	return false, errors.New("could not unseal vault")
 }
 
+func readConf(ctx context.Context, client *kubernetes.Clientset, filePath string, k8sNs string, k8sName string) (*VaultInitResponse, error) {
+	if client == nil {
+		var initResult VaultInitResponse
+		b, err := ioutil.ReadFile(inputFile)
+		if err != nil {
+			return nil, err
+		}
+		err = json.Unmarshal(b, &initResult)
+		if err != nil {
+			return nil, err
+		}
+
+		return &initResult, nil
+	}
+
+	secret, err := client.CoreV1().Secrets(k8sNs).Get(ctx, k8sName, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	var initResult VaultInitResponse
+	err = json.Unmarshal(secret.Data["value"], &initResult)
+	if err != nil {
+		return nil, err
+	}
+
+	return &initResult, nil
+}
+
+func writeConf(ctx context.Context, client *kubernetes.Clientset, filePath string, k8sNs string, k8sName string, initResult VaultInitResponse) error {
+	b, err := json.Marshal(&initResult)
+	if err != nil {
+		return fmt.Errorf("could not marshal the result: %w", err)
+	}
+
+	if client == nil {
+		err = ioutil.WriteFile(outputFile, b, 0640)
+		if err != nil {
+			return fmt.Errorf("could not save the vault initialization data: %w", err)
+		}
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: k8sName,
+		},
+		Data: map[string][]byte{
+			"value": b,
+		},
+	}
+
+	_, err = client.CoreV1().Secrets(k8sNs).Create(ctx, secret, metav1.CreateOptions{})
+
+	return err
+}
+
 func main() {
 	flag.Parse()
 
 	vaultAddr := os.Getenv("VAULT_ADDR")
 	if vaultAddr == "" {
 		vaultAddr = "http://localhost:8200"
+	}
+
+	var clientset *kubernetes.Clientset
+
+	if k8sSecret {
+		if k8sInCluster {
+			config, err := rest.InClusterConfig()
+			if err != nil {
+				panic(err.Error())
+			}
+			clientset, err = kubernetes.NewForConfig(config)
+			if err != nil {
+				panic(err.Error())
+			}
+		} else {
+			var kubeconfig *string
+			if home := homedir.HomeDir(); home != "" {
+				kubeconfig = flag.String("kubeconfig", filepath.Join(home, ".kube", "config"), "(optional) absolute path to the kubeconfig file")
+			} else {
+				kubeconfig = flag.String("kubeconfig", "", "absolute path to the kubeconfig file")
+			}
+			flag.Parse()
+
+			// use the current context in kubeconfig
+			config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
+			if err != nil {
+				panic(err.Error())
+			}
+
+			clientset, err = kubernetes.NewForConfig(config)
+			if err != nil {
+				panic(err.Error())
+			}
+		}
 	}
 
 	log.Printf("waiting for vault to be ready at %s\n", vaultAddr)
@@ -206,28 +320,18 @@ func main() {
 			log.Fatalf("could not initialize vault: %s\n", err)
 		}
 
-		b, err := json.Marshal(&initResult)
+		err = writeConf(context.Background(), clientset, outputFile, k8sSecretNamespace, k8sSecretName, *initResult)
 		if err != nil {
-			log.Fatalf("could not marshal the result: %s\n", err)
-		}
-
-		err = ioutil.WriteFile(outputFile, b, 0640)
-		if err != nil {
-			log.Fatalf("could not save the vault initialization data: %s\n", err)
+			log.Fatalf("could not save init result: %s\n", err)
 		}
 	}
 
 	// unseal vault if it is not unsealed yet
 	if status.Sealed {
 		log.Println("unsealing vault")
-		var initResult VaultInitResponse
-		b, err := ioutil.ReadFile(inputFile)
+		initResult, err := readConf(context.Background(), clientset, inputFile, k8sSecretNamespace, k8sSecretName)
 		if err != nil {
-			log.Fatalf("could not open vault init data: %s\n", err)
-		}
-		err = json.Unmarshal(b, &initResult)
-		if err != nil {
-			log.Fatalf("could not unmarshal vault init data: %s\n", err)
+			panic(err)
 		}
 
 		unsealed, err := unsealVault(vaultAddr, initResult.Keys)
