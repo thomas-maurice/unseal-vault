@@ -236,6 +236,7 @@ func writeConf(ctx context.Context, client *kubernetes.Clientset, filePath strin
 		if err != nil {
 			return fmt.Errorf("could not save the vault initialization data: %w", err)
 		}
+		return nil
 	}
 
 	secret := &corev1.Secret{
